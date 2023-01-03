@@ -1,0 +1,5 @@
+shroomdk
+google-cloud-bigquery==2.34.3
+google-cloud-bigquery-storage==2.13.1
+google-cloud-storage==2.7.0
+PyYAML

@@ -1,0 +1,1156 @@
+agg:
+ - src: flipside
+   chain: solana
+   query: >
+      with tx as (
+        -- Get txn data
+        select 
+          date(date_trunc('{{level}}' , block_timestamp)) dt
+          , tx_id
+          , instructions
+          , signers[0] address 
+        from solana.core.fact_transactions
+        where date(block_timestamp) >= date('{{start_dt}}')
+        and date(block_timestamp) <= date('{{end_dt}}')
+        and succeeded = 1
+      ),  
+      p as (
+        -- Expload programs for txn
+        select 
+          tx_id
+          , e.value:programId programid
+        from tx,
+          Table(Flatten(tx.instructions)) e
+        where programid not in ('ComputeBudget111111111111111111111111111111','Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo','MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr','KeccakSecp256k11111111111111111111111111111') -- solana internal contracts
+      ),    
+      pl as (   
+        -- Get program names & types
+        select distinct
+          tx_id
+          , case when programid in ('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA','ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL','11111111111111111111111111111111') then 'TokenProgram' else programid end programid
+          , case when l.label = 'solana' then null else l.label end app_name
+          , case when programid = 'Stake11111111111111111111111111111111111111' then 'staking'
+             when l.label = 'solana' then null 
+            else l.label_type end tx_type
+        from p
+        left join solana.core.dim_labels l
+          on p.programid = l.address  
+      ),
+      pa as (
+        -- Reaggregate programs per txn
+        select 
+          tx_id
+          , listagg(programid, ', ') within group (order by programid desc) programs
+          , listagg(app_name, ', ') within group (order by programid desc) app_name
+          , listagg(tx_type, ', ') within group (order by programid desc) tx_type
+        from pl 
+        group by 1
+      ),
+      l as (
+        -- Get token and NFT names
+        select *
+        from
+        (
+          -- Get token names  
+          select
+            token_address address
+            , upper(symbol) address_name
+            , 'token' label_subtype
+          from solana.core.dim_tokens
+          group by 1,2,3
+        )
+        union all
+        (
+          -- Get NFT names
+          select      
+            contract_address address
+            , contract_name address_name
+            , 'nft' label_subtype
+          from solana.core.dim_nft_metadata
+          group by 1,2,3
+        )
+      ),
+      d as (
+        -- Join txns to aggregate program data and transfer data
+        select distinct
+          tx.dt
+          , tx.tx_id tx_hash
+          , tx.address wallet_address
+          , case 
+              when pa.programs like 'TokenProgram, %' then replace(pa.programs,'TokenProgram, ','')
+              when pa.programs like '%, TokenProgram%' then replace(pa.programs,', TokenProgram','')        
+              when pa.programs = 'TokenProgram' then 'n/a'
+            else pa.programs end app_address
+          , case 
+              when pa.programs = 'TokenProgram' then 'n/a' 
+              when app_name = '' then null
+              else app_name end app_name  
+          , case 
+              when pa.programs = 'TokenProgram' and tf.mint is null then 'nft/token'      
+              when pa.programs = 'TokenProgram' then 'transfer'
+              when tx_type = '' then 'unknown'
+              else tx_type end app_type
+          , case 
+              when tf.mint is null then 'n/a' 
+              else tf.mint end asset_address
+          , case 
+              when tf.mint is null then 'no assets transferred' 
+              else l.address_name end asset_name
+          , case 
+              when l.label_subtype is not null then l.label_subtype
+              when tf.mint is null then 'n/a' 
+              -- when tf.mint is not null then 'nft/token' 
+            else 'unknown' end asset_type
+        from tx
+        left join pa
+          on tx.tx_id = pa.tx_id
+        left join solana.core.fact_transfers tf
+          on tx.tx_id = tf.tx_id
+          and date(tf.block_timestamp) >= date('{{start_dt}}')
+          and date(tf.block_timestamp) <= date('{{end_dt}}')
+        left join l
+          on tf.mint = l.address    
+      )
+      select 
+        dt
+        , count(distinct tx_hash) tx_ct
+        , count(distinct wallet_address) address_ct
+        , count(distinct app_address) app_ct
+        , count(distinct asset_address) asset_ct 
+      from d
+      group by 1
+      order by tx_ct desc
+
+ - src: bigquery
+   chain: polygon
+   query: >
+      with t as (
+        -- Get all transactions
+        select 
+          `hash` tx_hash
+          , date(date_trunc(block_timestamp, {{level}})) dt
+          , from_address wallet_address
+          , to_address
+          , value
+        from `public-data-finance.crypto_polygon.transactions` 
+        where date(block_timestamp) >= date('{{start_dt}}')
+        and date(block_timestamp) <= date('{{end_dt}}')  
+        and receipt_status = 1
+      ),
+      tf as (
+        -- Get all asset transfers
+        select *
+        from
+        (
+          -- Get matic transfers
+          select tx_hash, '0x' asset_address, '' value
+          from t
+          where value > 0
+        )
+        union all
+        (
+          -- Get non-matic transfers
+          select distinct
+              transaction_hash tx_hash
+            , token_address asset_address
+            , value
+          from `public-data-finance.crypto_polygon.token_transfers`
+          where date(block_timestamp) >= date('{{start_dt}}')
+          and date(block_timestamp) <= date('{{end_dt}}')    
+        )
+      ),
+      c as (
+          -- Get contracts w/ address, name, and type
+          select 
+              contracts.address
+              , coalesce(m.name, al.name, cl.address_name, null) name
+              , coalesce(m.type, case when al.typ is null then null else al.typ || ' asset' end, cl.label_type, null) type
+          from `public-data-finance.crypto_polygon.contracts` contracts -- contract addresses from gcp
+          left join 
+          (
+             SELECT * FROM UNNEST([STRUCT<address STRING, name STRING, type STRING>
+              ('0x2791bca1f2de4661ed88a30c99a7a9449aa84174','USDC', 'token asset'),
+              ('0xc2132d05d31c914a87c6611c10748aeb04b58e8f','USDT','token asset'),
+              ('0x8f3cf7ad23cd3cadbd9735aff958023239c6a063','DAI','token asset'),
+              ('0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6','WBTC','token asset'),
+              ('0x00000000006c3852cbef3e08e8df289169ede581','OpenSea','nft')])  
+          ) m -- manual labels for popular contracts
+              on contracts.address = m.address    
+          left join `primo-data-338518.blockchain_data.asset_labels` al -- asset labels from chainbase
+              on contracts.address = al.contract_address
+              and al.chain = 'polygon'    
+          left join `primo-data-338518.blockchain_data.contract_labels` cl -- contract labels from flipside
+              on contracts.address = cl.address
+              and cl.chain = 'polygon'
+      ),
+      d as (
+        -- List of every transaction w/ primary contract (app) and assets transferred
+        select distinct 
+          t.dt
+          , t.tx_hash
+          , t.wallet_address
+          , case 
+              when c.type like '%asset' then 'n/a'
+              when c.address is null and t.value > 0 then 'n/a' 
+              when c.address is null then 'unknown'
+              else c.address end app_address
+          , case 
+              when c.type like '%asset' then 'n/a'
+              when c.address is null and t.value > 0 then 'n/a' 
+              when c.address is null then 'unknown' 
+              else c.name end app_name
+          , case 
+              when c.address is null and t.value > 0 then 'transfer' 
+              when c.address is null then 'unknown'
+              when c.type like '%asset' and tf.asset_address is not null then 'transfer' 
+              when c.type like '%asset' then 'nft/token' 
+              when c.type is null then 'unknown'
+              else c.type end app_type
+          , case 
+              when tf.asset_address is null then 'n/a' 
+              else tf.asset_address end asset_address
+          , case 
+              when tf.asset_address is null then 'no assets transferred'
+              when tf.asset_address = '0x' then 'MATIC' 
+              else a.name end asset_name
+          , case 
+              when tf.asset_address is null then 'n/a'
+              when tf.asset_address = '0x' then 'token' 
+              when a.type is null then 'unknown'
+            else replace(a.type, ' asset','') end asset_type
+          , case when a.type = 'nft asset' then tf.value else '' end asset_id
+        from t
+        left join tf
+          on tf.tx_hash = t.tx_hash
+        left join c
+          on t.to_address = c.address
+        left join c a
+          on tf.asset_address = a.address
+      )
+      select 
+        dt
+        , count(distinct tx_hash) tx_ct
+        , count(distinct wallet_address) address_ct
+        , count(distinct app_address) app_ct
+        , count(distinct (asset_address || asset_id)) asset_ct
+      from d
+      group by 1
+      order by tx_ct desc
+
+ - src: bigquery
+   chain: bitcoin
+   query: >
+      with btc as (
+          SELECT
+              transactions.hash as tx_hash
+              , date(date_trunc(transactions.block_timestamp, {{level}})) dt
+              ,inputs.addresses
+          FROM `bigquery-public-data.crypto_bitcoin.transactions` as transactions,
+              transactions.inputs as inputs
+          where date(block_timestamp) >= date('{{start_dt}}')
+          and date(block_timestamp) <= date('{{end_dt}}')
+          and date(block_timestamp_month) = date('{{start_mth_dt}}')
+      ),
+      btc_d as (
+          select 
+              btc.dt
+              , btc.tx_hash
+              , a wallet_address
+              , 'n/a' app
+              , 'transfer' app_type
+              , 'BTC' asset
+              , 'token' asset_type
+          from btc,
+              unnest(addresses) a
+      )
+      select 
+          dt
+          , count(distinct tx_hash) tx_ct
+          , count(distinct wallet_address) address_ct
+          , count(distinct app) app_ct
+          , count(distinct asset) asset_ct          
+      from btc_d
+      group by 1
+
+ - src: bigquery
+   chain: ethereum
+   query: >
+      with e_t as (
+        -- Get all transactions
+        select 
+          `hash` tx_hash
+          , date(date_trunc(block_timestamp, {{level}})) dt
+          , from_address wallet_address
+          , to_address
+          , value
+        from `bigquery-public-data.crypto_ethereum.transactions`
+        where date(block_timestamp) >= date('{{start_dt}}')
+        and date(block_timestamp) <= date('{{end_dt}}')  
+        and receipt_status = 1
+      ),
+      e_tf as (
+        -- Get all asset transfers
+        select *
+        from
+        (
+          -- Get eth transfers
+          select tx_hash, '0x' asset_address, '' value
+          from e_t
+          where value > 0
+        )
+        union all
+        (
+          -- Get non-eth transfers
+          select distinct
+              transaction_hash tx_hash
+            , token_address asset_address
+            , value
+          from `bigquery-public-data.crypto_ethereum.token_transfers`
+          where date(block_timestamp) >= date('{{start_dt}}')
+          and date(block_timestamp) <= date('{{end_dt}}')      
+        )
+      ),
+      e_c as (
+          -- Get contracts w/ address, name, and type
+          select 
+              e_contracts.address
+              , coalesce(e_m.name, e_al.name, e_cl.address_name, null) name
+              , coalesce(e_m.type, case when e_al.typ is null then null else e_al.typ || ' asset' end, e_cl.label_type, null) type
+          from `bigquery-public-data.crypto_ethereum.contracts` e_contracts -- contract addresses from gcp
+          left join 
+          (
+             SELECT * FROM UNNEST([STRUCT<address STRING, name STRING, type STRING>
+              ('0x2791bca1f2de4661ed88a30c99a7a9449aa84174','USDC', 'token asset'),
+              ('0xc2132d05d31c914a87c6611c10748aeb04b58e8f','USDT','token asset'),
+              ('0x8f3cf7ad23cd3cadbd9735aff958023239c6a063','DAI','token asset'),
+              ('0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6','WBTC','token asset'),
+              ('0x00000000006c3852cbef3e08e8df289169ede581','OpenSea','nft')])  
+          ) e_m -- manual labels for popular contracts
+              on e_contracts.address = e_m.address    
+          left join `primo-data-338518.blockchain_data.asset_labels` e_al -- asset labels from chainbase
+              on e_contracts.address = e_al.contract_address
+              and e_al.chain = 'ethereum'    
+          left join `primo-data-338518.blockchain_data.contract_labels` e_cl -- contract labels from flipside
+              on e_contracts.address = e_cl.address
+              and e_cl.chain = 'ethereum'
+      ),
+      e_d as (
+        -- List of every transaction w/ primary contract (app) and assets transferred
+        select distinct 
+          e_t.dt
+          , e_t.tx_hash
+          , e_t.wallet_address
+          , case 
+              when e_c.type like '%asset' then 'n/a'
+              when e_c.address is null and e_t.value > 0 then 'n/a' 
+              when e_c.address is null then 'unknown'
+              else e_c.address end app_address
+          , case 
+              when e_c.type like '%asset' then 'n/a'
+              when e_c.address is null and e_t.value > 0 then 'n/a' 
+              when e_c.address is null then 'unknown' 
+              else e_c.name end app_name
+          , case 
+              when e_c.address is null and e_t.value > 0 then 'transfer' 
+              when e_c.address is null then 'unknown'
+              when e_c.type like '%asset' and e_tf.asset_address is not null then 'transfer' 
+              when e_c.type like '%asset' then 'nft/token' 
+              when e_c.type is null then 'unknown'
+              else e_c.type end app_type
+          , case 
+              when e_tf.asset_address is null then 'n/a' 
+              else e_tf.asset_address end asset_address
+          , case 
+              when e_tf.asset_address is null then 'no assets transferred'
+              when e_tf.asset_address = '0x' then 'ETH' 
+              else e_a.name end asset_name
+          , case 
+              when e_tf.asset_address is null then 'n/a'
+              when e_tf.asset_address = '0x' then 'token' 
+              when e_a.type is null then 'unknown'
+            else replace(e_a.type, ' asset','') end asset_type
+          , case when e_a.type = 'nft asset' then e_tf.value else '' end asset_id
+        from e_t
+        left join e_tf
+          on e_tf.tx_hash = e_t.tx_hash
+        left join e_c
+          on e_t.to_address = e_c.address
+        left join e_c e_a
+          on e_tf.asset_address = e_a.address
+      )
+      select 
+        dt
+        , count(distinct tx_hash) tx_ct
+        , count(distinct wallet_address) address_ct
+        , count(distinct app_address) app_ct
+        , count(distinct (asset_address || asset_id)) asset_ct  
+      from e_d
+      group by 1
+      order by tx_ct desc
+
+agg_apps:
+ - src: flipside
+   chain: solana
+   query: >
+      with tx as (
+        -- Get txn data
+        select 
+          date(date_trunc('{{level}}' , block_timestamp)) dt
+          , tx_id
+          , instructions
+          , signers[0] address 
+        from solana.core.fact_transactions
+        where date(block_timestamp) >= date('{{start_dt}}')
+        and date(block_timestamp) <= date('{{end_dt}}')
+        and succeeded = 1
+      ),  
+      p as (
+        -- Expload programs for txn
+        select 
+          tx_id
+          , e.value:programId programid
+        from tx,
+          Table(Flatten(tx.instructions)) e
+        where programid not in ('ComputeBudget111111111111111111111111111111','Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo','MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr','KeccakSecp256k11111111111111111111111111111') -- solana internal contracts
+      ),    
+      pl as (   
+        -- Get program names & types
+        select distinct
+          tx_id
+          , case when programid in ('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA','ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL','11111111111111111111111111111111') then 'TokenProgram' else programid end programid
+          , case when l.label = 'solana' then null else l.label end app_name
+          , case when programid = 'Stake11111111111111111111111111111111111111' then 'staking'
+             when l.label = 'solana' then null 
+            else l.label_type end tx_type
+        from p
+        left join solana.core.dim_labels l
+          on p.programid = l.address  
+      ),
+      pa as (
+        -- Reaggregate programs per txn
+        select 
+          tx_id
+          , listagg(programid, ', ') within group (order by programid desc) programs
+          , listagg(app_name, ', ') within group (order by programid desc) app_name
+          , listagg(tx_type, ', ') within group (order by programid desc) tx_type
+        from pl 
+        group by 1
+      ),
+      l as (
+        -- Get token and NFT names
+        select *
+        from
+        (
+          -- Get token names  
+          select
+            token_address address
+            , upper(symbol) address_name
+            , 'token' label_subtype
+          from solana.core.dim_tokens
+          group by 1,2,3
+        )
+        union all
+        (
+          -- Get NFT names
+          select      
+            contract_address address
+            , contract_name address_name
+            , 'nft' label_subtype
+          from solana.core.dim_nft_metadata
+          group by 1,2,3
+        )
+      ),
+      d as (
+        -- Join txns to aggregate program data and transfer data
+        select distinct
+          tx.dt
+          , tx.tx_id tx_hash
+          , tx.address wallet_address
+          , case 
+              when pa.programs like 'TokenProgram, %' then replace(pa.programs,'TokenProgram, ','')
+              when pa.programs like '%, TokenProgram%' then replace(pa.programs,', TokenProgram','')        
+              when pa.programs = 'TokenProgram' then 'n/a'
+            else pa.programs end app_address
+          , case 
+              when pa.programs = 'TokenProgram' then 'n/a' 
+              when app_name = '' then null
+              else app_name end app_name  
+          , case 
+              when pa.programs = 'TokenProgram' and tf.mint is null then 'nft/token'      
+              when pa.programs = 'TokenProgram' then 'transfer'
+              when tx_type = '' then 'unknown'
+              else tx_type end app_type
+          , case 
+              when tf.mint is null then 'n/a' 
+              else tf.mint end asset_address
+          , case 
+              when tf.mint is null then 'no assets transferred' 
+              else l.address_name end asset_name
+          , case 
+              when l.label_subtype is not null then l.label_subtype
+              when tf.mint is null then 'n/a' 
+              -- when tf.mint is not null then 'nft/token' 
+            else 'unknown' end asset_type
+        from tx
+        left join pa
+          on tx.tx_id = pa.tx_id
+        left join solana.core.fact_transfers tf
+          on tx.tx_id = tf.tx_id
+          and date(tf.block_timestamp) >= date('{{start_dt}}')
+          and date(tf.block_timestamp) <= date('{{end_dt}}')
+        left join l
+          on tf.mint = l.address    
+      )
+      select 
+        dt
+        , coalesce(app_name, app_address) app
+        , app_type
+        , count(distinct tx_hash) tx_ct
+        , count(distinct wallet_address) address_ct
+      from d
+      group by 1,2,3
+
+ - src: bigquery
+   chain: polygon
+   query: >
+      with t as (
+        -- Get all transactions
+        select 
+          `hash` tx_hash
+          , date(date_trunc(block_timestamp, {{level}})) dt
+          , from_address wallet_address
+          , to_address
+          , value
+        from `public-data-finance.crypto_polygon.transactions` 
+        where date(block_timestamp) >= date('{{start_dt}}')
+        and date(block_timestamp) <= date('{{end_dt}}')
+        and receipt_status = 1
+      ),
+      tf as (
+        -- Get all asset transfers
+        select *
+        from
+        (
+          -- Get matic transfers
+          select tx_hash, '0x' asset_address
+          from t
+          where value > 0
+        )
+        union all
+        (
+          -- Get non-matic transfers
+          select distinct
+              transaction_hash tx_hash
+            , token_address asset_address
+          from `public-data-finance.crypto_polygon.token_transfers`
+          where date(block_timestamp) >= date('{{start_dt}}')
+          and date(block_timestamp) <= date('{{end_dt}}')
+        )
+      ),
+      c as (
+          -- Get contracts w/ address, name, and type
+          select 
+              contracts.address
+              , coalesce(m.name, al.name, cl.address_name, null) name
+              , coalesce(m.type, case when al.typ is null then null else al.typ || ' asset' end, cl.label_type, null) type
+          from `public-data-finance.crypto_polygon.contracts` contracts -- contract addresses from gcp
+          left join 
+          (
+             SELECT * FROM UNNEST([STRUCT<address STRING, name STRING, type STRING>
+              ('0x2791bca1f2de4661ed88a30c99a7a9449aa84174','USDC', 'token asset'),
+              ('0xc2132d05d31c914a87c6611c10748aeb04b58e8f','USDT','token asset'),
+              ('0x8f3cf7ad23cd3cadbd9735aff958023239c6a063','DAI','token asset'),
+              ('0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6','WBTC','token asset'),
+              ('0x00000000006c3852cbef3e08e8df289169ede581','OpenSea','nft')])  
+          ) m -- manual labels for popular contracts
+              on contracts.address = m.address    
+          left join `primo-data-338518.blockchain_data.asset_labels` al -- asset labels from chainbase
+              on contracts.address = al.contract_address
+              and al.chain = 'polygon'    
+          left join `primo-data-338518.blockchain_data.contract_labels` cl -- contract labels from flipside
+              on contracts.address = cl.address
+              and cl.chain = 'polygon'
+      ),
+      d as (
+        -- List of every transaction w/ primary contract (app) and assets transferred
+        select distinct 
+          t.dt
+          , t.tx_hash
+          , t.wallet_address
+          , case 
+              when c.type like '%asset' then 'n/a'
+              when c.address is null and t.value > 0 then 'n/a' 
+              when c.address is null then 'unknown'
+              else c.address end app_address
+          , case 
+              when c.type like '%asset' then 'n/a'
+              when c.address is null and t.value > 0 then 'n/a' 
+              when c.address is null then 'unknown' 
+              else c.name end app_name
+          , case 
+              when c.address is null and t.value > 0 then 'transfer' 
+              when c.address is null then 'unknown'
+              when c.type like '%asset' and tf.asset_address is not null then 'transfer' 
+              when c.type like '%asset' then 'nft/token' 
+              when c.type is null then 'unknown'
+              else c.type end app_type
+          , case 
+              when tf.asset_address is null then 'n/a' 
+              else tf.asset_address end asset_address
+          , case 
+              when tf.asset_address is null then 'no assets transferred'
+              when tf.asset_address = '0x' then 'MATIC' 
+              else a.name end asset_name
+          , case 
+              when tf.asset_address is null then 'n/a'
+              when tf.asset_address = '0x' then 'token' 
+              when a.type is null then 'unknown'
+            else replace(a.type, ' asset','') end asset_type
+        from t
+        left join tf
+          on tf.tx_hash = t.tx_hash
+        left join c
+          on t.to_address = c.address
+        left join c a
+          on tf.asset_address = a.address
+      )
+      select 
+        dt
+        , coalesce(app_name, app_address) app
+        , app_type
+        , count(distinct tx_hash) tx_ct
+        , count(distinct wallet_address) address_ct
+      from d
+      group by 1,2,3
+      order by tx_ct desc
+
+ - src: bigquery
+   chain: bitcoin
+   query: >
+      with btc as (
+          SELECT
+              transactions.hash as tx_hash
+              , date(date_trunc(transactions.block_timestamp, {{level}})) dt
+              ,inputs.addresses
+          FROM `bigquery-public-data.crypto_bitcoin.transactions` as transactions,
+              transactions.inputs as inputs
+          where date(block_timestamp) >= date('{{start_dt}}')
+          and date(block_timestamp) <= date('{{end_dt}}')
+          and date(block_timestamp_month) = date('{{start_mth_dt}}')
+      ),
+      btc_d as (
+          select 
+              btc.dt
+              , btc.tx_hash
+              , a wallet_address
+              , 'n/a' app
+              , 'transfer' app_type
+              , 'BTC' asset
+              , 'token' asset_type
+          from btc,
+              unnest(addresses) a
+      )
+      select 
+        dt
+        , app
+        , app_type
+        , count(distinct tx_hash) tx_ct
+        , count(distinct wallet_address) address_ct
+      from btc_d
+      group by 1,2,3
+
+ - src: bigquery
+   chain: ethereum
+   query: >
+      with e_t as (
+        -- Get all transactions
+        select 
+          `hash` tx_hash
+          , date(date_trunc(block_timestamp, {{level}})) dt
+          , from_address wallet_address
+          , to_address
+          , value
+        from `bigquery-public-data.crypto_ethereum.transactions`
+        where date(block_timestamp) >= date('{{start_dt}}')
+        and date(block_timestamp) <= date('{{end_dt}}')
+        and receipt_status = 1
+      ),
+      e_tf as (
+        -- Get all asset transfers
+        select *
+        from
+        (
+          -- Get eth transfers
+          select tx_hash, '0x' asset_address
+          from e_t
+          where value > 0
+        )
+        union all
+        (
+          -- Get non-eth transfers
+          select distinct
+              transaction_hash tx_hash
+            , token_address asset_address
+          from `bigquery-public-data.crypto_ethereum.token_transfers`
+          where date(block_timestamp) >= date('{{start_dt}}')
+          and date(block_timestamp) <= date('{{end_dt}}')
+        )
+      ),
+      e_c as (
+          -- Get contracts w/ address, name, and type
+          select 
+              e_contracts.address
+              , coalesce(e_m.name, e_al.name, e_cl.address_name, null) name
+              , coalesce(e_m.type, case when e_al.typ is null then null else e_al.typ || ' asset' end, e_cl.label_type, null) type
+          from `bigquery-public-data.crypto_ethereum.contracts` e_contracts -- contract addresses from gcp
+          left join 
+          (
+             SELECT * FROM UNNEST([STRUCT<address STRING, name STRING, type STRING>
+              ('0x2791bca1f2de4661ed88a30c99a7a9449aa84174','USDC', 'token asset'),
+              ('0xc2132d05d31c914a87c6611c10748aeb04b58e8f','USDT','token asset'),
+              ('0x8f3cf7ad23cd3cadbd9735aff958023239c6a063','DAI','token asset'),
+              ('0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6','WBTC','token asset'),
+              ('0x00000000006c3852cbef3e08e8df289169ede581','OpenSea','nft')])  
+          ) e_m -- manual labels for popular contracts
+              on e_contracts.address = e_m.address    
+          left join `primo-data-338518.blockchain_data.asset_labels` e_al -- asset labels from chainbase
+              on e_contracts.address = e_al.contract_address
+              and e_al.chain = 'ethereum'    
+          left join `primo-data-338518.blockchain_data.contract_labels` e_cl -- contract labels from flipside
+              on e_contracts.address = e_cl.address
+              and e_cl.chain = 'ethereum'
+      ),
+      e_d as (
+        -- List of every transaction w/ primary contract (app) and assets transferred
+        select distinct 
+          e_t.dt
+          , e_t.tx_hash
+          , e_t.wallet_address
+          , case 
+              when e_c.type like '%asset' then 'n/a'
+              when e_c.address is null and e_t.value > 0 then 'n/a' 
+              when e_c.address is null then 'unknown'
+              else e_c.address end app_address
+          , case 
+              when e_c.type like '%asset' then 'n/a'
+              when e_c.address is null and e_t.value > 0 then 'n/a' 
+              when e_c.address is null then 'unknown' 
+              else e_c.name end app_name
+          , case 
+              when e_c.address is null and e_t.value > 0 then 'transfer' 
+              when e_c.address is null then 'unknown'
+              when e_c.type like '%asset' and e_tf.asset_address is not null then 'transfer' 
+              when e_c.type like '%asset' then 'nft/token' 
+              when e_c.type is null then 'unknown'
+              else e_c.type end app_type
+          , case 
+              when e_tf.asset_address is null then 'n/a' 
+              else e_tf.asset_address end asset_address
+          , case 
+              when e_tf.asset_address is null then 'no assets transferred'
+              when e_tf.asset_address = '0x' then 'ETH' 
+              else e_a.name end asset_name
+          , case 
+              when e_tf.asset_address is null then 'n/a'
+              when e_tf.asset_address = '0x' then 'token' 
+              when e_a.type is null then 'unknown'
+            else replace(e_a.type, ' asset','') end asset_type
+        from e_t
+        left join e_tf
+          on e_tf.tx_hash = e_t.tx_hash
+        left join e_c
+          on e_t.to_address = e_c.address
+        left join e_c e_a
+          on e_tf.asset_address = e_a.address
+      )
+      select 
+        dt
+        , coalesce(app_name, app_address) app
+        , app_type
+        , count(distinct tx_hash) tx_ct
+        , count(distinct wallet_address) address_ct
+      from e_d
+      group by 1,2,3
+
+agg_assets:
+ - src: flipside
+   chain: solana
+   query: >
+      with tx as (
+        -- Get txn data
+        select 
+          date(date_trunc('{{level}}' , block_timestamp)) dt
+          , tx_id
+          , instructions
+          , signers[0] address 
+        from solana.core.fact_transactions
+        where date(block_timestamp) >= date('{{start_dt}}')
+        and date(block_timestamp) <= date('{{end_dt}}')
+        and succeeded = 1
+      ),  
+      p as (
+        -- Expload programs for txn
+        select 
+          tx_id
+          , e.value:programId programid
+        from tx,
+          Table(Flatten(tx.instructions)) e
+        where programid not in ('ComputeBudget111111111111111111111111111111','Memo1UhkJRfHyvLMcVucJwxXeuD728EqVDDwQDxFMNo','MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr','KeccakSecp256k11111111111111111111111111111') -- solana internal contracts
+      ),    
+      pl as (   
+        -- Get program names & types
+        select distinct
+          tx_id
+          , case when programid in ('TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA','ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL','11111111111111111111111111111111') then 'TokenProgram' else programid end programid
+          , case when l.label = 'solana' then null else l.label end app_name
+          , case when programid = 'Stake11111111111111111111111111111111111111' then 'staking'
+             when l.label = 'solana' then null 
+            else l.label_type end tx_type
+        from p
+        left join solana.core.dim_labels l
+          on p.programid = l.address  
+      ),
+      pa as (
+        -- Reaggregate programs per txn
+        select 
+          tx_id
+          , listagg(programid, ', ') within group (order by programid desc) programs
+          , listagg(app_name, ', ') within group (order by programid desc) app_name
+          , listagg(tx_type, ', ') within group (order by programid desc) tx_type
+        from pl 
+        group by 1
+      ),
+      l as (
+        -- Get token and NFT names
+        select *
+        from
+        (
+          -- Get token names  
+          select
+            token_address address
+            , upper(symbol) address_name
+            , 'token' label_subtype
+          from solana.core.dim_tokens
+          group by 1,2,3
+        )
+        union all
+        (
+          -- Get NFT names
+          select      
+            contract_address address
+            , contract_name address_name
+            , 'nft' label_subtype
+          from solana.core.dim_nft_metadata
+          group by 1,2,3
+        )
+      ),
+      d as (
+        -- Join txns to aggregate program data and transfer data
+        select distinct
+          tx.dt
+          , tx.tx_id tx_hash
+          , tx.address wallet_address
+          , case 
+              when pa.programs like 'TokenProgram, %' then replace(pa.programs,'TokenProgram, ','')
+              when pa.programs like '%, TokenProgram%' then replace(pa.programs,', TokenProgram','')        
+              when pa.programs = 'TokenProgram' then 'n/a'
+            else pa.programs end app_address
+          , case 
+              when pa.programs = 'TokenProgram' then 'n/a' 
+              when app_name = '' then null
+              else app_name end app_name  
+          , case 
+              when pa.programs = 'TokenProgram' and tf.mint is null then 'nft/token'      
+              when pa.programs = 'TokenProgram' then 'transfer'
+              when tx_type = '' then 'unknown'
+              else tx_type end app_type
+          , case 
+              when tf.mint is null then 'n/a' 
+              else tf.mint end asset_address
+          , case 
+              when tf.mint is null then 'no assets transferred' 
+              else l.address_name end asset_name
+          , case 
+              when l.label_subtype is not null then l.label_subtype
+              when tf.mint is null then 'n/a' 
+              -- when tf.mint is not null then 'nft/token' 
+            else 'unknown' end asset_type
+        from tx
+        left join pa
+          on tx.tx_id = pa.tx_id
+        left join solana.core.fact_transfers tf
+          on tx.tx_id = tf.tx_id
+          and date(tf.block_timestamp) >= date('{{start_dt}}')
+          and date(tf.block_timestamp) <= date('{{end_dt}}')
+        left join l
+          on tf.mint = l.address    
+      )
+      select 
+        dt
+        , coalesce(asset_name, asset_address) asset  
+        , asset_type
+        , count(distinct tx_hash) tx_ct
+        , count(distinct wallet_address) address_ct
+      from d
+      group by 1,2,3
+
+ - src: bigquery
+   chain: polygon
+   query: >
+      with t as (
+        -- Get all transactions
+        select 
+          `hash` tx_hash
+          , date(date_trunc(block_timestamp, {{level}})) dt
+          , from_address wallet_address
+          , to_address
+          , value
+        from `public-data-finance.crypto_polygon.transactions` 
+        where date(block_timestamp) >= date('{{start_dt}}')
+        and date(block_timestamp) <= date('{{end_dt}}')
+        and receipt_status = 1
+      ),
+      tf as (
+        -- Get all asset transfers
+        select *
+        from
+        (
+          -- Get matic transfers
+          select tx_hash, '0x' asset_address
+          from t
+          where value > 0
+        )
+        union all
+        (
+          -- Get non-matic transfers
+          select distinct
+              transaction_hash tx_hash
+            , token_address asset_address
+          from `public-data-finance.crypto_polygon.token_transfers`
+          where date(block_timestamp) >= date('{{start_dt}}')
+          and date(block_timestamp) <= date('{{end_dt}}')
+        )
+      ),
+      c as (
+          -- Get contracts w/ address, name, and type
+          select 
+              contracts.address
+              , coalesce(m.name, al.name, cl.address_name, null) name
+              , coalesce(m.type, case when al.typ is null then null else al.typ || ' asset' end, cl.label_type, null) type
+          from `public-data-finance.crypto_polygon.contracts` contracts -- contract addresses from gcp
+          left join 
+          (
+             SELECT * FROM UNNEST([STRUCT<address STRING, name STRING, type STRING>
+              ('0x2791bca1f2de4661ed88a30c99a7a9449aa84174','USDC', 'token asset'),
+              ('0xc2132d05d31c914a87c6611c10748aeb04b58e8f','USDT','token asset'),
+              ('0x8f3cf7ad23cd3cadbd9735aff958023239c6a063','DAI','token asset'),
+              ('0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6','WBTC','token asset'),
+              ('0x00000000006c3852cbef3e08e8df289169ede581','OpenSea','nft')])  
+          ) m -- manual labels for popular contracts
+              on contracts.address = m.address    
+          left join `primo-data-338518.blockchain_data.asset_labels` al -- asset labels from chainbase
+              on contracts.address = al.contract_address
+              and al.chain = 'polygon'    
+          left join `primo-data-338518.blockchain_data.contract_labels` cl -- contract labels from flipside
+              on contracts.address = cl.address
+              and cl.chain = 'polygon'
+      ),
+      d as (
+        -- List of every transaction w/ primary contract (app) and assets transferred
+        select distinct 
+          t.dt
+          , t.tx_hash
+          , t.wallet_address
+          , case 
+              when c.type like '%asset' then 'n/a'
+              when c.address is null and t.value > 0 then 'n/a' 
+              when c.address is null then 'unknown'
+              else c.address end app_address
+          , case 
+              when c.type like '%asset' then 'n/a'
+              when c.address is null and t.value > 0 then 'n/a' 
+              when c.address is null then 'unknown' 
+              else c.name end app_name
+          , case 
+              when c.address is null and t.value > 0 then 'transfer' 
+              when c.address is null then 'unknown'
+              when c.type like '%asset' and tf.asset_address is not null then 'transfer' 
+              when c.type like '%asset' then 'nft/token' 
+              when c.type is null then 'unknown'
+              else c.type end app_type
+          , case 
+              when tf.asset_address is null then 'n/a' 
+              else tf.asset_address end asset_address
+          , case 
+              when tf.asset_address is null then 'no assets transferred'
+              when tf.asset_address = '0x' then 'MATIC' 
+              else a.name end asset_name
+          , case 
+              when tf.asset_address is null then 'n/a'
+              when tf.asset_address = '0x' then 'token' 
+              when a.type is null then 'unknown'
+            else replace(a.type, ' asset','') end asset_type
+        from t
+        left join tf
+          on tf.tx_hash = t.tx_hash
+        left join c
+          on t.to_address = c.address
+        left join c a
+          on tf.asset_address = a.address
+      )
+      select 
+        dt
+        , coalesce(asset_name, asset_address) asset
+        , asset_type
+        , count(distinct tx_hash) tx_ct
+        , count(distinct wallet_address) address_ct
+      from d
+      group by 1,2,3
+
+ - src: bigquery
+   chain: bitcoin
+   query: >
+      with btc as (
+          SELECT
+              transactions.hash as tx_hash
+              , date(date_trunc(transactions.block_timestamp, {{level}})) dt
+              ,inputs.addresses
+          FROM `bigquery-public-data.crypto_bitcoin.transactions` as transactions,
+              transactions.inputs as inputs
+          where date(block_timestamp) >= date('{{start_dt}}')
+          and date(block_timestamp) <= date('{{end_dt}}')
+          and date(block_timestamp_month) = date('{{start_mth_dt}}')
+      ),
+      btc_d as (
+          select 
+              btc.dt
+              , btc.tx_hash
+              , a wallet_address
+              , 'n/a' app
+              , 'transfer' app_type
+              , 'BTC' asset
+              , 'token' asset_type
+          from btc,
+              unnest(addresses) a
+      )
+      select 
+        dt
+        , asset
+        , asset_type
+        , count(distinct tx_hash) tx_ct
+        , count(distinct wallet_address) address_ct
+      from btc_d
+      group by 1,2,3
+
+ - src: bigquery
+   chain: ethereum
+   query: >
+      with e_t as (
+        -- Get all transactions
+        select 
+          `hash` tx_hash
+          , date(date_trunc(block_timestamp, {{level}})) dt
+          , from_address wallet_address
+          , to_address
+          , value
+        from `bigquery-public-data.crypto_ethereum.transactions`
+        where date(block_timestamp) >= date('{{start_dt}}')
+        and date(block_timestamp) <= date('{{end_dt}}')
+        and receipt_status = 1
+      ),
+      e_tf as (
+        -- Get all asset transfers
+        select *
+        from
+        (
+          -- Get eth transfers
+          select tx_hash, '0x' asset_address
+          from e_t
+          where value > 0
+        )
+        union all
+        (
+          -- Get non-eth transfers
+          select distinct
+              transaction_hash tx_hash
+            , token_address asset_address
+          from `bigquery-public-data.crypto_ethereum.token_transfers`
+          where date(block_timestamp) >= date('{{start_dt}}')
+          and date(block_timestamp) <= date('{{end_dt}}')
+        )
+      ),
+      e_c as (
+          -- Get contracts w/ address, name, and type
+          select 
+              e_contracts.address
+              , coalesce(e_m.name, e_al.name, e_cl.address_name, null) name
+              , coalesce(e_m.type, case when e_al.typ is null then null else e_al.typ || ' asset' end, e_cl.label_type, null) type
+          from `bigquery-public-data.crypto_ethereum.contracts` e_contracts -- contract addresses from gcp
+          left join 
+          (
+             SELECT * FROM UNNEST([STRUCT<address STRING, name STRING, type STRING>
+              ('0x2791bca1f2de4661ed88a30c99a7a9449aa84174','USDC', 'token asset'),
+              ('0xc2132d05d31c914a87c6611c10748aeb04b58e8f','USDT','token asset'),
+              ('0x8f3cf7ad23cd3cadbd9735aff958023239c6a063','DAI','token asset'),
+              ('0x1bfd67037b42cf73acf2047067bd4f2c47d9bfd6','WBTC','token asset'),
+              ('0x00000000006c3852cbef3e08e8df289169ede581','OpenSea','nft')])  
+          ) e_m -- manual labels for popular contracts
+              on e_contracts.address = e_m.address    
+          left join `primo-data-338518.blockchain_data.asset_labels` e_al -- asset labels from chainbase
+              on e_contracts.address = e_al.contract_address
+              and e_al.chain = 'ethereum'    
+          left join `primo-data-338518.blockchain_data.contract_labels` e_cl -- contract labels from flipside
+              on e_contracts.address = e_cl.address
+              and e_cl.chain = 'ethereum'
+      ),
+      e_d as (
+        -- List of every transaction w/ primary contract (app) and assets transferred
+        select distinct 
+          e_t.dt
+          , e_t.tx_hash
+          , e_t.wallet_address
+          , case 
+              when e_c.type like '%asset' then 'n/a'
+              when e_c.address is null and e_t.value > 0 then 'n/a' 
+              when e_c.address is null then 'unknown'
+              else e_c.address end app_address
+          , case 
+              when e_c.type like '%asset' then 'n/a'
+              when e_c.address is null and e_t.value > 0 then 'n/a' 
+              when e_c.address is null then 'unknown' 
+              else e_c.name end app_name
+          , case 
+              when e_c.address is null and e_t.value > 0 then 'transfer' 
+              when e_c.address is null then 'unknown'
+              when e_c.type like '%asset' and e_tf.asset_address is not null then 'transfer' 
+              when e_c.type like '%asset' then 'nft/token' 
+              when e_c.type is null then 'unknown'
+              else e_c.type end app_type
+          , case 
+              when e_tf.asset_address is null then 'n/a' 
+              else e_tf.asset_address end asset_address
+          , case 
+              when e_tf.asset_address is null then 'no assets transferred'
+              when e_tf.asset_address = '0x' then 'ETH' 
+              else e_a.name end asset_name
+          , case 
+              when e_tf.asset_address is null then 'n/a'
+              when e_tf.asset_address = '0x' then 'token' 
+              when e_a.type is null then 'unknown'
+            else replace(e_a.type, ' asset','') end asset_type
+        from e_t
+        left join e_tf
+          on e_tf.tx_hash = e_t.tx_hash
+        left join e_c
+          on e_t.to_address = e_c.address
+        left join e_c e_a
+          on e_tf.asset_address = e_a.address
+      )
+      select 
+        dt
+        , coalesce(asset_name, asset_address) asset
+        , asset_type
+        , count(distinct tx_hash) tx_ct
+        , count(distinct wallet_address) address_ct
+      from e_d
+      group by 1,2,3
